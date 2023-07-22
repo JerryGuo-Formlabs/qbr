@@ -171,7 +171,7 @@ class Webcam:
             contour_neighbors[index] = []
             center_x = x + w / 2
             center_y = y + h / 2
-            radius = 1.5
+            radius = 0.2
 
             # Create 9 positions for the current contour which are the
             # neighbors. We'll use this to check how many neighbors each contour
@@ -231,10 +231,10 @@ class Webcam:
                 final_contours = neighbors
                 break
 
-        print("3: Found center")
-
         if not found:
             return []
+
+        print("3: Found center")
 
         # Step 4/4: When we reached this part of the code we found a cube-like
         # contour. The code below will sort all the contours on their X and Y
