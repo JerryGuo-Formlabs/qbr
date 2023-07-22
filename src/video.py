@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # vim: fenc=utf-8 ts=4 sw=4 et
+import threading
+from typing import Callable
+
+import os
+if os.uname()[4] == 'aarch64':
+    from libcamerawrapper import Camera
 
 import cv2
 from colordetection import color_detector
@@ -27,14 +33,49 @@ from constants import (
     E_INCORRECTLY_SCANNED,
     E_ALREADY_SOLVED
 )
+from mjpegserver import MjpegHandler, ThreadedHTTPServer
+from contourpipeline import ContourPipeline
+
+
+def _crop(image, width, height):
+    center = image.shape
+    x = center[1] / 2 - width / 2
+    y = center[0] / 2 - height / 2
+
+    return image[int(y):int(y + height), int(x):int(x + width)]
+
 
 class Webcam:
 
-    def __init__(self):
+    get_frame: Callable[[], cv2.UMat]
+
+    def __init__(self, mjpeg_server=True, cam_stream_port=9876):
+        self.frame: cv2.UMat | None = None
         print('Starting webcam... (this might take a while, please be patient)')
-        self.cam = cv2.VideoCapture(0)
+        if os.uname()[4] == 'aarch64':
+            # Use libcamera
+            self.cam = Camera(rotation_angle=180)
+            self.get_frame = self.cam.get_lores_stream_frame
+
+            self.width = Camera.lowres[0]
+            self.height = Camera.lowres[1]
+
+        else:
+            # Use OpenCV
+            self.cam = cv2.VideoCapture(0)
+
+            self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.width = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            self.get_frame = lambda: self.cam.read()[1]
+
+        self.display_frame = np.zeros((self.height, self.width, 3), np.uint8)
+
         print('Webcam successfully started')
 
+        self.contour_pipeline = ContourPipeline()
         self.colors_to_calibrate = ['green', 'red', 'blue', 'orange', 'white', 'yellow']
         self.average_sticker_colors = {}
         self.result_state = {}
@@ -46,15 +87,16 @@ class Webcam:
                                (255,255,255), (255,255,255), (255,255,255),
                                (255,255,255), (255,255,255), (255,255,255)]
 
-        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.width = int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
         self.calibrate_mode = False
         self.calibrated_colors = {}
         self.current_color_to_calibrate_index = 0
         self.done_calibrating = False
+
+        if mjpeg_server:
+            print(f"Starting server on port {cam_stream_port}")
+            self.server = ThreadedHTTPServer(('', cam_stream_port), MjpegHandler, lambda *args: None, lambda *args: None,
+                                        lambda: self.display_frame)
+            threading.Thread(target=self.server.serve_forever).start()
 
     def draw_stickers(self, stickers, offset_x, offset_y):
         """Draws the given stickers onto the given frame."""
@@ -94,16 +136,17 @@ class Webcam:
         y = STICKER_AREA_TILE_SIZE * 3 + STICKER_AREA_TILE_GAP * 2 + STICKER_AREA_OFFSET * 2
         self.draw_stickers(self.snapshot_state, STICKER_AREA_OFFSET, y)
 
-    def find_contours(self, dilatedFrame):
-        """Find the contours of a 3x3x3 cube."""
-        contours, hierarchy = cv2.findContours(dilatedFrame, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    def filter_contours(self, contours,):
+        """Filter the contours of a 3x3x3 cube."""
         final_contours = []
+
+        # print(f"1: Found {len(contours)} contours")
 
         # Step 1/4: filter all contours to only those that are square-ish shapes.
         for contour in contours:
             perimeter = cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, 0.1 * perimeter, True)
-            if len (approx) == 4:
+            if len(approx) >= 4:
                 area = cv2.contourArea(contour)
                 (x, y, w, h) = cv2.boundingRect(approx)
 
@@ -111,11 +154,12 @@ class Webcam:
                 ratio = w / float(h)
 
                 # Check if contour is close to a square.
-                if ratio >= 0.8 and ratio <= 1.2 and w >= 30 and w <= 60 and area / (w * h) > 0.4:
-                    final_contours.append((x, y, w, h))
+                # if 0.5 <= ratio <= 1.5:  # and 100 <= w <= 200: # and area / (w * h) > 0.4:
+                final_contours.append((x, y, w, h))
 
-        # Return early if we didn't found 9 or more contours.
+        # Return early if we didn't find 9 or more contours.
         if len(final_contours) < 9:
+            # print("Did not find enough contours")
             return []
 
         # Step 2/4: Find the contour that has 9 neighbors (including itself)
@@ -174,6 +218,8 @@ class Webcam:
                     if (x2 < x3 and y2 < y3) and (x2 + w2 > x3 and y2 + h2 > y3):
                         contour_neighbors[index].append(neighbor)
 
+        print(f"2: Found {len(contour_neighbors)} contour neighbors")
+
         # Step 3/4: Now that we know how many neighbors all contours have, we'll
         # loop over them and find the contour that has 9 neighbors, which
         # includes itself. This is the center piece of the cube. If we come
@@ -184,6 +230,8 @@ class Webcam:
                 found = True
                 final_contours = neighbors
                 break
+
+        print("3: Found center")
 
         if not found:
             return []
@@ -467,79 +515,83 @@ class Webcam:
 
         Returns a string of the scanned state in rubik's cube notation.
         """
-        while True:
-            _, frame = self.cam.read()
-            self.frame = frame
-            key = cv2.waitKey(10) & 0xff
+        try:
+            while True:
+                self.frame = self.get_frame()
+                key = cv2.waitKey(10) & 0xff
 
-            # Quit on escape.
-            if key == 27:
-                break
+                # Quit on escape.
+                if key == 27:
+                    break
 
-            if not self.calibrate_mode:
-                # Update the snapshot when space bar is pressed.
-                if key == 32:
-                    self.update_snapshot_state()
-
-                # Switch to another language.
-                if key == ord(SWITCH_LANGUAGE_KEY):
-                    next_locale = get_next_locale(config.get_setting('locale'))
-                    config.set_setting('locale', next_locale)
-                    i18n.set('locale', next_locale)
-
-            # Toggle calibrate mode.
-            if key == ord(CALIBRATE_MODE_KEY):
-                self.reset_calibrate_mode()
-                self.calibrate_mode = not self.calibrate_mode
-
-            grayFrame = cv2.cvtColor(self.frame, cv2.COLOR_BGR2GRAY)
-            blurredFrame = cv2.blur(grayFrame, (3, 3))
-            cannyFrame = cv2.Canny(blurredFrame, 30, 60, 3)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-            dilatedFrame = cv2.dilate(cannyFrame, kernel)
-
-            contours = self.find_contours(dilatedFrame)
-            if len(contours) == 9:
-                self.draw_contours(contours)
                 if not self.calibrate_mode:
-                    self.update_preview_state(contours)
-                elif key == 32 and self.done_calibrating is False:
-                    current_color = self.colors_to_calibrate[self.current_color_to_calibrate_index]
-                    (x, y, w, h) = contours[4]
-                    roi = self.frame[y+7:y+h-7, x+14:x+w-14]
-                    avg_bgr = color_detector.get_dominant_color(roi)
-                    self.calibrated_colors[current_color] = avg_bgr
-                    self.current_color_to_calibrate_index += 1
-                    self.done_calibrating = self.current_color_to_calibrate_index == len(self.colors_to_calibrate)
-                    if self.done_calibrating:
-                        color_detector.set_cube_color_pallete(self.calibrated_colors)
-                        config.set_setting(CUBE_PALETTE, color_detector.cube_color_palette)
+                    # Update the snapshot when space bar is pressed.
+                    if key == 32:
+                        self.update_snapshot_state()
 
-            if self.calibrate_mode:
-                self.draw_current_color_to_calibrate()
-                self.draw_calibrated_colors()
-            else:
-                self.draw_current_language()
-                self.draw_preview_stickers()
-                self.draw_snapshot_stickers()
-                self.draw_scanned_sides()
-                self.draw_2d_cube_state()
+                    # Switch to another language.
+                    if key == ord(SWITCH_LANGUAGE_KEY):
+                        next_locale = get_next_locale(config.get_setting('locale'))
+                        config.set_setting('locale', next_locale)
+                        i18n.set('locale', next_locale)
 
-            cv2.imshow("Qbr - Rubik's cube solver", self.frame)
+                # Toggle calibrate mode.
+                if key == ord(CALIBRATE_MODE_KEY):
+                    self.reset_calibrate_mode()
+                    self.calibrate_mode = not self.calibrate_mode
 
-        self.cam.release()
-        cv2.destroyAllWindows()
+                cropped = _crop(self.frame, 640, 480)
+                self.frame = cropped
+                contours = self.contour_pipeline.process(self.frame)
+                filtered = self.filter_contours(contours)
 
-        if len(self.result_state.keys()) != 6:
-            return E_INCORRECTLY_SCANNED
+                if len(filtered) == 9:
+                    self.draw_contours(filtered)
+                    if not self.calibrate_mode:
+                        self.update_preview_state(filtered)
+                    elif key == 32 and self.done_calibrating is False:
+                        current_color = self.colors_to_calibrate[self.current_color_to_calibrate_index]
+                        (x, y, w, h) = filtered[4]
+                        roi = self.frame[y+7:y+h-7, x+14:x+w-14]
+                        avg_bgr = color_detector.get_dominant_color(roi)
+                        self.calibrated_colors[current_color] = avg_bgr
+                        self.current_color_to_calibrate_index += 1
+                        self.done_calibrating = self.current_color_to_calibrate_index == len(self.colors_to_calibrate)
+                        if self.done_calibrating:
+                            color_detector.set_cube_color_pallete(self.calibrated_colors)
+                            config.set_setting(CUBE_PALETTE, color_detector.cube_color_palette)
 
-        if not self.scanned_successfully():
-            return E_INCORRECTLY_SCANNED
+                if self.calibrate_mode:
+                    self.draw_current_color_to_calibrate()
+                    self.draw_calibrated_colors()
+                else:
+                    self.draw_current_language()
+                    self.draw_preview_stickers()
+                    self.draw_snapshot_stickers()
+                    self.draw_scanned_sides()
+                    self.draw_2d_cube_state()
 
-        if self.state_already_solved():
-            return E_ALREADY_SOLVED
+                # cv2.imshow("Qbr - Rubik's cube solver", self.frame)
+                cv2.drawContours(self.frame, contours, -1, (255, 255, 255))
+                self.display_frame = self.frame
+        except KeyboardInterrupt:
+            print("Received interrupt, exiting...")
 
-        return self.get_result_notation()
+            self.cam.release()
+            self.server.stop()
+            self.server.server_close()
+            cv2.destroyAllWindows()
+
+            if len(self.result_state.keys()) != 6:
+                return E_INCORRECTLY_SCANNED
+
+            if not self.scanned_successfully():
+                return E_INCORRECTLY_SCANNED
+
+            if self.state_already_solved():
+                return E_ALREADY_SOLVED
+
+            return self.get_result_notation()
 
 
 webcam = Webcam()

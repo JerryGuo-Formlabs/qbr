@@ -180,3 +180,4 @@ class Camera:
     def release(self):
         self.camera.stop()
         Camera.thread = None
+        self.camera = None

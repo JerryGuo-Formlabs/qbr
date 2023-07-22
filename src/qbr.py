@@ -5,6 +5,7 @@
 import sys
 import kociemba
 import argparse
+
 from video import webcam
 import i18n
 import os
@@ -64,6 +65,7 @@ class Qbr:
         elif code == E_ALREADY_SOLVED:
             print('\033[0;33m[{}] {}'.format(i18n.t('error'), i18n.t('cubeAlreadySolved')))
         sys.exit(code)
+
 
 if __name__ == '__main__':
     # Define the application arguments.
